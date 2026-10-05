@@ -1,36 +1,45 @@
+# ============================================================
+# Phase 10 Configuration — Extended Zero-Shot Tests
+# ============================================================
+
 max_agents: 10
 local_radius: 5
 max_steps_factor: 4
 obstacle_density: 0.15
 base_seed: 42
 
+# ---- Pheromone & Communication ----
 d_pheromone: 5
 d_comm: 10
 tau_pheromone: 0.95
 
-reward_new_cell: 1.0
-reward_step: -1.0
+# ---- Reward shaping ----
+reward_new_cell: 2.0
+reward_step: -0.1
 cooperative_factor: 0.25
 idle_threshold: 8
 
+# ---- RL hyperparameters ----
 gamma: 0.99
-tau: 0.01
-lr_agent: 5.0e-4
-lr_mixer: 1.0e-3
+tau: 0.02                  # soft-update rate for target networks (was 0.01)
+lr_agent: 5.0e-5           # agent learning rate (was 1e-4)
+lr_mixer: 5.0e-4           # mixer learning rate
 weight_decay: 1.0e-5
 temperature: 1.0
 noisy_sigma_init: 0.3
 
-max_episodes_in_buffer: 200
+# ---- Replay buffer & training loop ----
+max_episodes_in_buffer: 500
 sequence_length: 16
-min_episodes_before_training: 100
-batch_size: 16
+min_episodes_before_training: 20
+batch_size: 32
 
-warmup_episodes: 50
+warmup_episodes: 0
 prioritized_updates: 50
 prioritized_alpha: 2.0
 chi: 0.5
 
+# ---- Curriculum stages: (width, height, max_episodes) ----
 stages:
   - [4, 4, 500]
   - [6, 6, 800]
@@ -40,37 +49,89 @@ stages:
   - [15, 15, 2500]
   - [18, 18, 3000]
 
-target_coverage: 0.96
-streak_for_early_stop: 8
+target_coverage: 1
+streak_for_early_stop: 5e5
 eval_freq: 5
 
-final_tests: [20, 25, 28, 30, 35, 40]
+# ---- Zero-shot evaluation ----
+final_tests: [20, 25, 28, 30, 35, 40, 50, 55, 60]
 agent_counts_for_tests: [1, 3, 5, 8, 10]
 
+# ✅ NEW: For very large maps (>= 50), only test key agent counts
+#    to keep runtime manageable.
+agent_counts_for_large_maps: [5, 10]
+large_map_threshold: 50
+
+# ✅ NEW: Per-size server count (scales with map dimensions)
+#    Larger maps need more servers to keep the RL policy effective;
+#    otherwise most agents fall into survival mode (BFS), which
+#    invalidates zero-shot RL evaluation.
+num_servers_per_size:
+  20: 3
+  25: 3
+  28: 3
+  30: 3
+  35: 4
+  40: 4
+  50: 5
+  55: 6
+  60: 6
+
+# ✅ NEW: Per-size max_steps_factor (larger maps need more steps)
+test_max_steps_factor_per_size:
+  20: 8
+  25: 8
+  28: 8
+  30: 8
+  35: 8
+  40: 8
+  50: 10
+  55: 11
+  60: 12
+
+# ✅ NEW: Per-size number of trials (fewer trials on slow maps)
+num_trials_per_size:
+  20: 5
+  25: 5
+  28: 5
+  30: 5
+  35: 5
+  40: 5
+  50: 3
+  55: 3
+  60: 3
+
+# ---- Network architecture ----
 agent_hidden_size: 512
 gru_hidden_size: 128
 node_feat_dim: 1056
 
+# ---- Paths ----
 checkpoint_dir: "checkpoints"
 best_model_name: "best_ctde.pt"
 video_dir: "videos"
 
+# ---- Rollback / early-stop ----
 rollback_patience: 40
 max_rollbacks: 3
 prioritized_alpha_final: 0.3
 
-test_max_steps_factor: 8
+# ---- Failure tolerance tests ----
+test_max_steps_factor: 8         # default fallback if per-size not set
 failure_agent_counts: [3, 5, 8, 10]
 
-num_servers: 3
+# ---- Server network ----
+num_servers: 3                    # default fallback if per-size not set
 server_placement: "fixed"
+survival_policy: rl               # 'rl' or 'bfs'
 
-survival_policy: rl    # or 'bfs'
+# ---- Observation windows ----
+worker_local_radius: 2            # 5×5 window (2*2 + 1)
+server_local_radius: 5            # 11×11 window (5*2 + 1)  ← corrected from 10×10
 
-worker_local_radius: 2    # 5x5 window (2*2 + 1)
-server_local_radius: 5    # 10x10 window (5*2 + 1)
-
+# ---- Energy / battery model ----
 battery_capacity: 1000
 energy_move: 1.0
 energy_stay: 0.5
-energy_penalty: 0.01     # negative reward per energy unit
+energy_penalty: 0.01
+collision_penalty: -2.0
