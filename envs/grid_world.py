@@ -15,7 +15,11 @@ class GridWorld:
                  energy_stay: float = 0.5,
                  energy_penalty: float = 0.01,
                  enforce_collisions: bool = True,
-                 apply_fallback: bool = True):
+                 apply_fallback: bool = True,
+                 reward_new_cell: float = 1.0,
+                 reward_step: float = -1.0,
+                 cooperative_factor: float = 0.25,
+                 collision_penalty: float = -2.0):
         self.width = width
         self.height = height
         self.num_agents = num_agents
@@ -29,7 +33,12 @@ class GridWorld:
         self._rl_survival_callback = None
         self.enforce_collisions = enforce_collisions
         self.apply_fallback = apply_fallback
-
+        
+        # ---- Reward coefficients (from config) ----
+        self.k_n = reward_new_cell
+        self.k_ts = reward_step
+        self.K = cooperative_factor
+        self.k_c = collision_penalty
         self.battery_capacity = battery_capacity
         self.energy_move = energy_move
         self.energy_stay = energy_stay
@@ -795,10 +804,10 @@ class GridWorld:
 
         # Reward
         team_new_cells = len(self.global_visited) - len(global_visited_before)
-        K = 0.25
-        k_n = 1.0
-        k_ts = -1.0
-        k_c = -2.0
+        K = self.K
+        k_n = self.k_n
+        k_ts = self.k_ts
+        k_c = self.k_c
 
         energy_cost = 0.0
         for i in range(self.active_agents):

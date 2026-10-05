@@ -47,7 +47,12 @@ class CoverageEnv(gym.Env):
             energy_stay=config.get('energy_stay', 0.5),
             energy_penalty=config.get('energy_penalty', 0.01),
             enforce_collisions=self.enforce_collisions,
-            apply_fallback=self.apply_fallback
+            apply_fallback=self.apply_fallback,
+            # ---- NEW: reward coefficients from config ----
+            reward_new_cell=config.get('reward_new_cell', 1.0),
+            reward_step=config.get('reward_step', -1.0),
+            cooperative_factor=config.get('cooperative_factor', 0.25),
+            collision_penalty=config.get('collision_penalty', -2.0),
         )
 
         self.obs_builder = ObservationBuilder(
