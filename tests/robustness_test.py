@@ -1,8 +1,18 @@
 import sys, os, yaml
 import numpy as np
+import matplotlib
+
+# ✅ FIXED: Try interactive backend, fall back to Agg for headless environments.
+try:
+    matplotlib.use('TkAgg')
+    INTERACTIVE = True
+except Exception:
+    matplotlib.use('Agg')
+    INTERACTIVE = False
 import matplotlib.pyplot as plt
 import torch
 
+# ✅ FIXED: sys.path must be set BEFORE project imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from envs.coverage_env import CoverageEnv
@@ -19,22 +29,40 @@ with open(config_path, 'r') as f:
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 MAX_AGENTS = cfg['max_agents']
-WORKER_RADIUS = cfg['worker_local_radius']   # 2 (5x5)
-SERVER_RADIUS = cfg['server_local_radius']   # 5 (10x10)
+WORKER_RADIUS = cfg['worker_local_radius']   # 5x5 window (radius=2)
+SERVER_RADIUS = cfg['server_local_radius']   # 11x11 window (radius=5)
 IN_CHANNELS = 12 + (MAX_AGENTS - 1)
 SCALAR_DIM = 15 + MAX_AGENTS + 1   # +1 for battery
 
-def load_model():
-    checkpoint_path = os.path.join(os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name'])
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+# ✅ FIXED: Paths for both checkpoints
+STAGE_FINAL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], 'stage_final.pt'
+)
+BEST_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name']
+)
 
+
+# ============================================================================
+# ✅ FIXED: load_model() prefers stage_final.pt (exact end-of-curriculum network)
+#    over best_ctde.pt.
+# ============================================================================
+def load_model():
+    if os.path.exists(STAGE_FINAL_PATH):
+        checkpoint_path = STAGE_FINAL_PATH
+        print(f"✅ Loading model from END-OF-CURRICULUM: {checkpoint_path}")
+    else:
+        checkpoint_path = BEST_MODEL_PATH
+        print(f"⚠️  stage_final.pt not found, falling back to best_ctde.pt: {checkpoint_path}")
+
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     shared_q_net = QNetwork(action_dim=5, scalar_dim=SCALAR_DIM, in_channels=IN_CHANNELS).to(device)
     state_dict = checkpoint['agent_net']
     model_state = shared_q_net.state_dict()
 
-    # Adapt if scalar dimension changed
-    if ('scalar_fc.weight' in state_dict and 
-        state_dict['scalar_fc.weight'].shape != model_state['scalar_fc.weight'].shape):
+    # Adapt if scalar dimension changed (battery added)
+    if ('scalar_fc.weight' in state_dict and
+            state_dict['scalar_fc.weight'].shape != model_state['scalar_fc.weight'].shape):
         print("⚠️  Scalar dimension mismatch – adapting checkpoint to new size.")
         old_weight = state_dict['scalar_fc.weight']
         old_bias = state_dict['scalar_fc.bias']
@@ -49,6 +77,10 @@ def load_model():
     shared_q_net.eval()
     return shared_q_net
 
+
+# ============================================================================
+# Server placement — greedy optimization
+# ============================================================================
 def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADIUS):
     if num_servers == 0:
         return []
@@ -61,8 +93,8 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             for x in range(width):
                 if grid[y, x] == 0 and (x, y) not in chosen_positions:
                     score = 0
-                    for dy in range(-radius, radius+1):
-                        for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius + 1):
+                        for dx in range(-radius, radius + 1):
                             nx, ny = x + dx, y + dy
                             if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0 and not covered[ny, nx]:
                                 score += 1
@@ -73,14 +105,17 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             break
         chosen_positions.append(best_pos)
         bx, by = best_pos
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
                 nx, ny = bx + dx, by + dy
                 if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0:
                     covered[ny, nx] = True
     return chosen_positions
 
-# ========== Improved Filter 2 (Iterative Local Coordination) ==========
+
+# ============================================================================
+# Improved Filter 2 (iterative local coordination)
+# ============================================================================
 def improved_filter2(actions, positions, active):
     actions = actions.copy()
     num_agents = len(actions)
@@ -130,7 +165,7 @@ def improved_filter2(actions, positions, active):
             if (not active[i]) or actions[i] == 4:
                 staying_positions.add(positions[i])
 
-        # Resolve common destinations among moving agents
+        # Resolve common destinations
         cell_to_agents = {}
         for i, (nx, ny) in enumerate(proposed):
             if active[i] and actions[i] != 4:
@@ -143,11 +178,11 @@ def improved_filter2(actions, positions, active):
                     actions[loser] = 4
                     changed = True
 
-        # Block swaps among active moving agents
+        # Block swaps
         for i in range(num_agents):
             if not active[i] or actions[i] == 4:
                 continue
-            for j in range(i+1, num_agents):
+            for j in range(i + 1, num_agents):
                 if not active[j] or actions[j] == 4:
                     continue
                 if proposed[i] == positions[j] and proposed[j] == positions[i]:
@@ -159,9 +194,13 @@ def improved_filter2(actions, positions, active):
             break
 
     return actions
-# =====================================================================
 
-def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1, max_steps_factor=8, obstacle_map=None):
+
+# ============================================================================
+# Run a single test (with or without server failure)
+# ============================================================================
+def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
+             max_steps_factor=8, obstacle_map=None):
     optimal_server_positions = place_servers_optimally(map_size, map_size, obstacle_map, num_servers)
 
     env_config = {
@@ -212,7 +251,7 @@ def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
     battery_off_history = []
 
     while not done and step < env.max_steps:
-        # ---- Server failure ----
+        # ---- Server failure event ----
         if failure_step > 0 and step == failure_step and not failure_triggered and active_server_count > 0:
             to_remove = min(servers_to_fail, active_server_count)
             print(f"\n*** SERVER FAILURE at step {step}: Removing {to_remove} server(s) ***")
@@ -235,7 +274,7 @@ def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
 
                 env.world.reassign_normal_agents()
 
-        # ---- Actions ----
+        # ---- Collect actions ----
         actions = []
         for i, wrapper in enumerate(agent_wrappers):
             act, _ = wrapper.select_action(obs_list[i], training=False)
@@ -243,14 +282,14 @@ def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
         while len(actions) < MAX_AGENTS:
             actions.append(4)
 
-        # ====== IMPROVED FILTER 2 ======
+        # ---- Apply Filter 2 ----
         original_actions = actions[:num_agents].copy()
         positions = env.world.agent_positions[:num_agents]
         active = env.world.agent_active[:num_agents]
         filtered = improved_filter2(original_actions, positions, active)
         actions[:num_agents] = filtered
-        # ================================
 
+        # ---- Step environment ----
         obs_tuple, _, term, trunc, info = env.step(actions, training=False)
         done = term or trunc
         step += 1
@@ -272,10 +311,10 @@ def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
                     server_coverage_history[s].append(scov)
 
         if step % 200 == 0:
-            print(f"Step {step}: Coverage = {info['coverage']*100:.1f}%")
+            print(f"Step {step}: Coverage = {info['coverage'] * 100:.1f}%")
 
     final_coverage = info['coverage'] if info else 0.0
-    print(f"\nFinal coverage: {final_coverage*100:.1f}% in {step} steps.")
+    print(f"\nFinal coverage: {final_coverage * 100:.1f}% in {step} steps.")
 
     return {
         'coverage_history': coverage_history,
@@ -294,17 +333,24 @@ def run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail=1,
         'battery_off_history': battery_off_history,
     }
 
-def plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_servers, failure_step, servers_to_fail):
+
+# ============================================================================
+# Plot results (with/without failure comparison)
+# ============================================================================
+def plot_results(results_with_fail, results_no_fail, map_size, num_agents,
+                 num_servers, failure_step, servers_to_fail):
     fig, axes = plt.subplots(2, 3, figsize=(18, 10))
 
     # ---- Coverage comparison ----
     ax = axes[0, 0]
     if results_no_fail:
         steps_no = np.arange(len(results_no_fail['coverage_history']))
-        ax.plot(steps_no, np.array(results_no_fail['coverage_history']) * 100, 'b-', label='Without Failure', linewidth=2)
+        ax.plot(steps_no, np.array(results_no_fail['coverage_history']) * 100,
+                'b-', label='Without Failure', linewidth=2)
     if results_with_fail:
         steps_fail = np.arange(len(results_with_fail['coverage_history']))
-        ax.plot(steps_fail, np.array(results_with_fail['coverage_history']) * 100, 'r-', label='With Failure', linewidth=2)
+        ax.plot(steps_fail, np.array(results_with_fail['coverage_history']) * 100,
+                'r-', label='With Failure', linewidth=2)
         if results_with_fail['failure_triggered']:
             ax.axvline(failure_step, color='black', linestyle='--', alpha=0.5, label='Failure')
     ax.set_xlabel('Step')
@@ -345,7 +391,8 @@ def plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_s
 
     # ---- Battery over time ----
     ax = axes[1, 0]
-    for res, color, label in zip([results_with_fail, results_no_fail], ['green', 'blue'], ['With Failure', 'Without Failure']):
+    for res, color, label in zip([results_with_fail, results_no_fail],
+                                 ['green', 'blue'], ['With Failure', 'Without Failure']):
         if res:
             batt_avg = [np.mean(b) / 1000 * 100 for b in res['battery_history']]
             ax.plot(np.arange(len(batt_avg)), batt_avg, color=color, label=label)
@@ -357,9 +404,11 @@ def plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_s
 
     # ---- Active agents over time ----
     ax = axes[1, 1]
-    for res, color, label in zip([results_with_fail, results_no_fail], ['red', 'blue'], ['With Failure', 'Without Failure']):
+    for res, color, label in zip([results_with_fail, results_no_fail],
+                                 ['red', 'blue'], ['With Failure', 'Without Failure']):
         if res:
-            ax.plot(np.arange(len(res['active_history'])), res['active_history'], color=color, label=label)
+            ax.plot(np.arange(len(res['active_history'])), res['active_history'],
+                    color=color, label=label)
     ax.set_xlabel('Step')
     ax.set_ylabel('Active Agents')
     ax.set_title('Active Agents Over Time')
@@ -368,11 +417,13 @@ def plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_s
 
     # ---- Battery-off agents over time ----
     ax = axes[1, 2]
-    for res, color, label in zip([results_with_fail, results_no_fail], ['red', 'blue'], ['With Failure', 'Without Failure']):
+    for res, color, label in zip([results_with_fail, results_no_fail],
+                                 ['red', 'blue'], ['With Failure', 'Without Failure']):
         if res:
-            ax.plot(np.arange(len(res['battery_off_history'])), res['battery_off_history'], color=color, label=label)
+            ax.plot(np.arange(len(res['battery_off_history'])), res['battery_off_history'],
+                    color=color, label=label)
     ax.set_xlabel('Step')
-    ax.set_ylabel('Battery‑off Agents')
+    ax.set_ylabel('Battery-off Agents')
     ax.set_title('Number of Depleted Agents')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -380,58 +431,76 @@ def plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_s
     plt.tight_layout()
     save_path = os.path.join(os.path.dirname(__file__), '..', 'videos', 'server_failure_test.png')
     plt.savefig(save_path, dpi=150)
-    plt.show()
     print(f"Plot saved to {save_path}")
 
+    # ✅ FIXED: Only show interactively if GUI is available
+    if INTERACTIVE:
+        plt.show()
+    else:
+        print("(Non-interactive backend — plot saved but not shown)")
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 def main():
     print("\n=== ROBUSTNESS TEST (Server Failure) ===\n")
     try:
         map_size = int(input("Enter map size (e.g., 20): "))
-    except:
+    except Exception:
         map_size = 20
     try:
         num_agents = int(input("Enter number of agents (e.g., 5): "))
         if num_agents > MAX_AGENTS:
-            print(f"⚠️ Warning: Requested {num_agents} agents, but MAX_AGENTS is {MAX_AGENTS}. Capping to {MAX_AGENTS}.")
+            print(f"⚠️ Warning: Requested {num_agents} agents, but MAX_AGENTS is {MAX_AGENTS}. "
+                  f"Capping to {MAX_AGENTS}.")
             num_agents = MAX_AGENTS
-    except:
+    except Exception:
         num_agents = 5
     try:
         num_servers = int(input("Enter total number of servers (default 3): ") or 3)
-    except:
+    except Exception:
         num_servers = 3
     try:
         servers_to_fail = int(input(f"How many servers should fail (1 to {num_servers})? (default 1): ") or 1)
         servers_to_fail = min(max(servers_to_fail, 1), num_servers)
-    except:
+    except Exception:
         servers_to_fail = 1
     try:
         failure_step = int(input("Enter failure step (0 for no failure, default half of max_steps): ") or 0)
-    except:
+    except Exception:
         failure_step = 0
     run_baseline = input("Also run without failure for comparison? (y/n): ").strip().lower() == 'y'
 
-    print("\n" + "="*60)
-    print(f"Map: {map_size}×{map_size} | Agents: {num_agents} | Servers: {num_servers} | Fail: {servers_to_fail} | Step: {failure_step if failure_step > 0 else 'None'}")
-    print("="*60)
+    print("\n" + "=" * 60)
+    print(f"Map: {map_size}×{map_size} | Agents: {num_agents} | "
+          f"Servers: {num_servers} | Fail: {servers_to_fail} | "
+          f"Step: {failure_step if failure_step > 0 else 'None'}")
+    print("=" * 60)
 
     print("Generating obstacle map...")
-    temp_grid_world = GridWorld(width=map_size, height=map_size, obstacle_density=cfg['obstacle_density'])
+    temp_grid_world = GridWorld(width=map_size, height=map_size,
+                                obstacle_density=cfg['obstacle_density'])
     fixed_grid = temp_grid_world.grid
 
     if failure_step > 0:
         print(">> Running with failure...")
-        results_with_fail = run_test(map_size, num_agents, num_servers, failure_step, servers_to_fail, obstacle_map=fixed_grid)
+        results_with_fail = run_test(map_size, num_agents, num_servers,
+                                     failure_step, servers_to_fail,
+                                     obstacle_map=fixed_grid)
     else:
         results_with_fail = None
 
     if run_baseline:
         print(">> Running without failure (baseline)...")
-        results_no_fail = run_test(map_size, num_agents, num_servers, 0, 0, obstacle_map=fixed_grid)
+        results_no_fail = run_test(map_size, num_agents, num_servers, 0, 0,
+                                    obstacle_map=fixed_grid)
     else:
         results_no_fail = None
 
-    plot_results(results_with_fail, results_no_fail, map_size, num_agents, num_servers, failure_step, servers_to_fail)
+    plot_results(results_with_fail, results_no_fail, map_size, num_agents,
+                 num_servers, failure_step, servers_to_fail)
+
 
 if __name__ == "__main__":
     main()

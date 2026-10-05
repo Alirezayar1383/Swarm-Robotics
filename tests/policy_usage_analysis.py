@@ -1,10 +1,18 @@
 import sys, os, yaml
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')  # برای نمایش پنجره
+
+# ✅ FIXED: Try interactive backend, fall back to Agg for headless environments.
+try:
+    matplotlib.use('TkAgg')
+    INTERACTIVE = True
+except Exception:
+    matplotlib.use('Agg')
+    INTERACTIVE = False
 import matplotlib.pyplot as plt
 import torch
 
+# ✅ FIXED: sys.path must be set BEFORE project imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from envs.coverage_env import CoverageEnv
@@ -12,6 +20,7 @@ from envs.grid_world import GridWorld
 from agents.agent_wrapper import AgentWrapper
 from models.dqn_network import QNetwork
 
+# ---- Load config ----
 config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'phase9_config.yaml')
 if not os.path.exists(config_path):
     config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'phase4_2_config.yaml')
@@ -25,14 +34,39 @@ SERVER_RADIUS = cfg['server_local_radius']
 IN_CHANNELS = 12 + (MAX_AGENTS - 1)
 SCALAR_DIM = 15 + MAX_AGENTS + 1
 
+# ✅ FIXED: Paths for both checkpoints
+STAGE_FINAL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], 'stage_final.pt'
+)
+BEST_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name']
+)
+
+
+# ============================================================================
+# ✅ FIXED: load_model() now prefers `stage_final.pt` (exact end-of-curriculum
+#    network) over `best_ctde.pt`. Ensures the analysis uses the same trained
+#    network as the final evaluation and training summary.
+# ============================================================================
 def load_model():
-    checkpoint_path = os.path.join(os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name'])
+    if os.path.exists(STAGE_FINAL_PATH):
+        checkpoint_path = STAGE_FINAL_PATH
+        print(f"✅ Loading model from END-OF-CURRICULUM: {checkpoint_path}")
+    else:
+        checkpoint_path = BEST_MODEL_PATH
+        print(f"⚠️  stage_final.pt not found, falling back to best_ctde.pt: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
     shared_q_net = QNetwork(action_dim=5, scalar_dim=SCALAR_DIM, in_channels=IN_CHANNELS).to(device)
     shared_q_net.load_state_dict(checkpoint['agent_net'])
     shared_q_net.eval()
     return shared_q_net
 
+
+# ============================================================================
+# Server placement — greedy optimization
+#   Note: radius=5 produces an 11×11 observation window (5 + center + 5).
+# ============================================================================
 def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADIUS):
     if num_servers == 0:
         return []
@@ -45,8 +79,8 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             for x in range(width):
                 if grid[y, x] == 0 and (x, y) not in chosen_positions:
                     score = 0
-                    for dy in range(-radius, radius+1):
-                        for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius + 1):
+                        for dx in range(-radius, radius + 1):
                             nx, ny = x + dx, y + dy
                             if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0 and not covered[ny, nx]:
                                 score += 1
@@ -57,14 +91,21 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             break
         chosen_positions.append(best_pos)
         bx, by = best_pos
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
                 nx, ny = bx + dx, by + dy
                 if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0:
                     covered[ny, nx] = True
     return chosen_positions
 
-# ========== Improved Filter 2 (Iterative) ==========
+
+# ============================================================================
+# Improved Filter 2 (Local Coordination, iterative)
+#   - Blocks moves into stationary cells
+#   - Resolves shared destinations (closest agent has priority)
+#   - Prevents head-on swaps
+#   Always active during evaluation to guarantee zero physical collisions.
+# ============================================================================
 def improved_filter2(actions, positions, active):
     actions = actions.copy()
     num_agents = len(actions)
@@ -83,16 +124,19 @@ def improved_filter2(actions, positions, active):
             elif act == 3: nx = x - 1; ny = y
             else:          nx, ny = x, y
             proposed.append((nx, ny))
+
         staying_positions = set()
         for i in range(num_agents):
             if (not active[i]) or actions[i] == 4:
                 staying_positions.add(positions[i])
+
         for i in range(num_agents):
             if active[i] and actions[i] != 4:
                 if proposed[i] in staying_positions:
                     actions[i] = 4
                     changed = True
-        # Recompute
+
+        # Recompute proposed after changes
         proposed = []
         for i in range(num_agents):
             x, y = positions[i]
@@ -103,25 +147,29 @@ def improved_filter2(actions, positions, active):
             elif act == 3: nx = x - 1; ny = y
             else:          nx, ny = x, y
             proposed.append((nx, ny))
+
         staying_positions = set()
         for i in range(num_agents):
             if (not active[i]) or actions[i] == 4:
                 staying_positions.add(positions[i])
+
         cell_to_agents = {}
         for i, (nx, ny) in enumerate(proposed):
             if active[i] and actions[i] != 4:
                 cell_to_agents.setdefault((nx, ny), []).append(i)
+
         for cell, agents in cell_to_agents.items():
             if len(agents) > 1:
                 agents.sort(key=lambda i: abs(positions[i][0] - cell[0]) + abs(positions[i][1] - cell[1]))
                 for loser in agents[1:]:
                     actions[loser] = 4
                     changed = True
-        # Block swaps
+
+        # Block head-on swaps
         for i in range(num_agents):
             if not active[i] or actions[i] == 4:
                 continue
-            for j in range(i+1, num_agents):
+            for j in range(i + 1, num_agents):
                 if not active[j] or actions[j] == 4:
                     continue
                 if proposed[i] == positions[j] and proposed[j] == positions[i]:
@@ -131,9 +179,13 @@ def improved_filter2(actions, positions, active):
         if not changed:
             break
     return actions
-# ======================================================
 
-def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_factor=8, failure_step=0, servers_to_fail=0):
+
+# ============================================================================
+# Run a single episode and collect policy usage statistics
+# ============================================================================
+def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_factor=8,
+                             failure_step=0, servers_to_fail=0):
     temp_world = GridWorld(width=map_size, height=map_size, obstacle_density=cfg['obstacle_density'])
     fixed_grid = temp_world.grid
 
@@ -176,7 +228,7 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
     active_server_count = num_servers
 
     while not done and step < env.max_steps:
-        # Server failure
+        # ---- Server failure event ----
         if failure_step > 0 and step == failure_step and not failure_triggered and active_server_count > 0:
             to_remove = min(servers_to_fail, active_server_count)
             print(f"\n*** SERVER FAILURE at step {step}: Removing {to_remove} server(s) ***")
@@ -195,6 +247,7 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
                     env.world.switch_agent_to_survival(agent_id)
                 env.world.reassign_normal_agents()
 
+        # ---- Collect actions ----
         actions = []
         for i in range(num_agents):
             act, _ = agent_wrappers[i].select_action(obs_list[i], training=False)
@@ -202,7 +255,7 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
         while len(actions) < MAX_AGENTS:
             actions.append(4)
 
-        # Apply improved filter2
+        # ---- Apply Filter 2 (Local Coordination) ----
         filtered = improved_filter2(
             actions[:num_agents],
             env.world.agent_positions[:num_agents],
@@ -210,6 +263,7 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
         )
         actions[:num_agents] = filtered
 
+        # ---- Step the environment ----
         obs_tuple, _, term, trunc, info = env.step(actions, training=False)
         done = term or trunc
         obs_list = list(obs_tuple)
@@ -223,8 +277,10 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
     usage = info['policy_usage']
     final_cov = info['coverage'] * 100
 
+    # ---- Console summary ----
     print(f"\n=== Policy Usage Analysis ===")
-    print(f"Map size: {map_size}×{map_size}, Agents: {num_agents}, Servers: {num_servers}, Steps: {step}")
+    print(f"Map size: {map_size}×{map_size}, Agents: {num_agents}, "
+          f"Servers: {num_servers}, Steps: {step}")
     if failure_triggered:
         print(f"Failure at step {failure_step} – Removed {servers_to_fail} servers")
     print(f"Final Coverage: {final_cov:.1f}%")
@@ -241,14 +297,15 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
                      usage['survival_bfs_actions'] + usage['survival_rl_actions'])
     if total_actions > 0:
         print(f"\nPercentages:")
-        print(f"  RL actions:               {usage['rl_actions']/total_actions*100:.1f}%")
-        print(f"  Fallback actions:         {usage['fallback_actions']/total_actions*100:.1f}%")
-        print(f"  Survival BFS actions:     {usage['survival_bfs_actions']/total_actions*100:.1f}%")
-        print(f"  Survival RL actions:      {usage['survival_rl_actions']/total_actions*100:.1f}%")
+        print(f"  RL actions:               {usage['rl_actions'] / total_actions * 100:.1f}%")
+        print(f"  Fallback actions:         {usage['fallback_actions'] / total_actions * 100:.1f}%")
+        print(f"  Survival BFS actions:     {usage['survival_bfs_actions'] / total_actions * 100:.1f}%")
+        print(f"  Survival RL actions:      {usage['survival_rl_actions'] / total_actions * 100:.1f}%")
 
-    # Plot with title including steps, servers, coverage, collisions (both types)
+    # ---- Plot ----
     labels = ['RL Actions', 'Normal Fallback', 'Survival BFS', 'Survival RL']
-    values = [usage['rl_actions'], usage['fallback_actions'], usage['survival_bfs_actions'], usage['survival_rl_actions']]
+    values = [usage['rl_actions'], usage['fallback_actions'],
+              usage['survival_bfs_actions'], usage['survival_rl_actions']]
     colors = ['green', 'orange', 'blue', 'red']
 
     plt.figure(figsize=(12, 6))
@@ -260,15 +317,29 @@ def run_episode_and_collect(map_size=20, num_agents=5, num_servers=3, max_steps_
     ]
     if failure_triggered:
         title_lines.append(f'Failure at step {failure_step} (Removed {servers_to_fail} servers)')
-    title_lines.append(f'Final Coverage: {final_cov:.1f}% | AA About: {total_aa_about} | AA Actual: {total_aa_actual} | AO About: {total_ao_about} | AO Actual: {total_ao_actual}')
+    title_lines.append(
+        f'Final Coverage: {final_cov:.1f}% | AA About: {total_aa_about} | '
+        f'AA Actual: {total_aa_actual} | AO About: {total_ao_about} | AO Actual: {total_ao_actual}'
+    )
     plt.title('\n'.join(title_lines), fontsize=11)
     plt.grid(axis='y', alpha=0.3)
     plt.tight_layout()
     save_path = os.path.join(os.path.dirname(__file__), '..', 'videos', 'policy_usage.png')
     plt.savefig(save_path, dpi=150)
     print(f"\nPlot saved to {save_path}")
-    plt.show()
 
+    # ✅ FIXED: Only show interactively if a GUI backend is available
+    if INTERACTIVE:
+        plt.show()
+    else:
+        print("(Non-interactive backend — plot saved but not shown)")
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 if __name__ == "__main__":
-
-    run_episode_and_collect(map_size=50, num_agents=10, num_servers=10, failure_step=430, servers_to_fail=7)
+    # ✅ FIXED: This scenario matches Figure 4-39 in the thesis
+    #    (50×50 map, 10 agents, 10 servers, fail 7 servers at step 430)
+    run_episode_and_collect(map_size=40, num_agents=7, num_servers=4,
+                            failure_step=450, servers_to_fail=4)

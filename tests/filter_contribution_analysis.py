@@ -1,14 +1,18 @@
 import sys, os, yaml
 import numpy as np
 import matplotlib
-# تلاش برای بک‌اند تعاملی
+
+# ✅ FIXED: Try interactive backend, fall back to Agg for headless environments
 try:
     matplotlib.use('TkAgg')
-except:
+    INTERACTIVE = True
+except Exception:
     matplotlib.use('Agg')
+    INTERACTIVE = False
 import matplotlib.pyplot as plt
 import torch
 
+# ✅ FIXED: sys.path must be set BEFORE project imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from envs.coverage_env import CoverageEnv
@@ -16,6 +20,7 @@ from envs.grid_world import GridWorld
 from agents.agent_wrapper import AgentWrapper
 from models.dqn_network import QNetwork
 
+# ---- Load config ----
 config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'phase9_config.yaml')
 if not os.path.exists(config_path):
     config_path = os.path.join(os.path.dirname(__file__), '..', 'configs', 'phase4_2_config.yaml')
@@ -29,14 +34,38 @@ SERVER_RADIUS = cfg['server_local_radius']
 IN_CHANNELS = 12 + (MAX_AGENTS - 1)
 SCALAR_DIM = 15 + MAX_AGENTS + 1
 
+# ✅ FIXED: Paths for both checkpoints
+STAGE_FINAL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], 'stage_final.pt'
+)
+BEST_MODEL_PATH = os.path.join(
+    os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name']
+)
+
+
+# ============================================================================
+# ✅ FIXED: load_model() now prefers stage_final.pt (exact end-of-curriculum
+#    network) over best_ctde.pt.
+# ============================================================================
 def load_model():
-    checkpoint_path = os.path.join(os.path.dirname(__file__), '..', cfg['checkpoint_dir'], cfg['best_model_name'])
+    if os.path.exists(STAGE_FINAL_PATH):
+        checkpoint_path = STAGE_FINAL_PATH
+        print(f"✅ Loading model from END-OF-CURRICULUM: {checkpoint_path}")
+    else:
+        checkpoint_path = BEST_MODEL_PATH
+        print(f"⚠️  stage_final.pt not found, falling back to best_ctde.pt: {checkpoint_path}")
+
     checkpoint = torch.load(checkpoint_path, map_location=device)
     shared_q_net = QNetwork(action_dim=5, scalar_dim=SCALAR_DIM, in_channels=IN_CHANNELS).to(device)
     shared_q_net.load_state_dict(checkpoint['agent_net'])
     shared_q_net.eval()
     return shared_q_net
 
+
+# ============================================================================
+# Greedy server placement — scales to any number of servers.
+#   Note: radius=5 produces an 11×11 observation window (5 + center + 5).
+# ============================================================================
 def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADIUS):
     if num_servers == 0:
         return []
@@ -49,8 +78,8 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             for x in range(width):
                 if grid[y, x] == 0 and (x, y) not in chosen_positions:
                     score = 0
-                    for dy in range(-radius, radius+1):
-                        for dx in range(-radius, radius+1):
+                    for dy in range(-radius, radius + 1):
+                        for dx in range(-radius, radius + 1):
                             nx, ny = x + dx, y + dy
                             if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0 and not covered[ny, nx]:
                                 score += 1
@@ -61,14 +90,17 @@ def place_servers_optimally(width, height, grid, num_servers, radius=SERVER_RADI
             break
         chosen_positions.append(best_pos)
         bx, by = best_pos
-        for dy in range(-radius, radius+1):
-            for dx in range(-radius, radius+1):
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
                 nx, ny = bx + dx, by + dy
                 if 0 <= nx < width and 0 <= ny < height and grid[ny, nx] == 0:
                     covered[ny, nx] = True
     return chosen_positions
 
-# ================== Improved Filter 2 (Iterative) ==================
+
+# ============================================================================
+# Improved Filter 2 (iterative local coordination)
+# ============================================================================
 def improved_filter2(actions, positions, active):
     actions = actions.copy()
     num_agents = len(actions)
@@ -125,7 +157,7 @@ def improved_filter2(actions, positions, active):
         for i in range(num_agents):
             if not active[i] or actions[i] == 4:
                 continue
-            for j in range(i+1, num_agents):
+            for j in range(i + 1, num_agents):
                 if not active[j] or actions[j] == 4:
                     continue
                 if proposed[i] == positions[j] and proposed[j] == positions[i]:
@@ -135,23 +167,22 @@ def improved_filter2(actions, positions, active):
         if not changed:
             break
     return actions
-# =====================================================================
 
+
+# ============================================================================
+# Run a scenario with given filter settings.
+#   Returns: total_agent_collisions, total_obstacle_collisions,
+#            total_steps, total_coverage
+#   Note: Filter 3 (enforce_collisions) is DISABLED so we can isolate the
+#         contributions of Filter 1 (masking) and Filter 2 (local coordination).
+# ============================================================================
 def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enabled, trials=3):
-    """
-    Runs a scenario with given settings.
-    Returns: total_agent_collisions, total_obstacle_collisions, total_steps, total_coverage
-    """
     temp_world = GridWorld(width=map_size, height=map_size, obstacle_density=cfg['obstacle_density'])
     fixed_grid = temp_world.grid
 
-    # Simple server placement
-    if num_servers == 1:
-        server_positions = [(map_size//2, map_size//2)]
-    elif num_servers == 2:
-        server_positions = [(map_size//4, map_size//2), (3*map_size//4, map_size//2)]
-    else:
-        server_positions = [(map_size//4, map_size//2), (map_size//2, map_size//2), (3*map_size//4, map_size//2)]
+    # ✅ FIXED: Use greedy optimal placement — scales to any number of servers.
+    #    Previous code fell back to 3 hardcoded positions for num_servers > 3.
+    server_positions = place_servers_optimally(map_size, map_size, fixed_grid, num_servers)
 
     env_config = {
         'width': map_size, 'height': map_size,
@@ -168,7 +199,7 @@ def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enable
         'energy_penalty': cfg.get('energy_penalty', 0.01),
     }
 
-    # Disable filter3 (enforce_collisions=False) and fallback (apply_fallback=True)
+    # ✅ FIXED: Filter 3 (enforce_collisions) is DISABLED; fallback is enabled.
     env = CoverageEnv(
         env_config,
         max_agents=MAX_AGENTS,
@@ -177,17 +208,18 @@ def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enable
         server_positions=server_positions,
         obstacle_map=fixed_grid,
         worker_local_radius=WORKER_RADIUS,
-        enforce_collisions=False,
-        apply_fallback=True
+        enforce_collisions=False,   # Filter 3 OFF
+        apply_fallback=True         # Fallback ON
     )
 
     shared_q_net = load_model()
-    agent_wrappers = [AgentWrapper(i, shared_q_net, device, mask_enabled=mask_enabled) for i in range(num_agents)]
+    agent_wrappers = [AgentWrapper(i, shared_q_net, device, mask_enabled=mask_enabled)
+                      for i in range(num_agents)]
 
     total_agent_collisions = 0
     total_obstacle_collisions = 0
     total_steps = 0
-    total_coverage = 0
+    total_coverage = 0.0
 
     for _ in range(trials):
         obs_tuple, _ = env.reset()
@@ -208,7 +240,7 @@ def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enable
             while len(actions) < MAX_AGENTS:
                 actions.append(4)
 
-            # Apply filter2 if requested
+            # Apply Filter 2 if requested
             if filter2_enabled:
                 filtered = improved_filter2(
                     actions[:num_agents],
@@ -222,14 +254,14 @@ def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enable
             obs_list = list(obs_tuple)
             step += 1
 
-            # Count collisions (agent-obstacle, agent-agent)
+            # Count actual collisions post-step
             positions = env.world.agent_positions[:num_agents]
             for i in range(num_agents):
                 x, y = positions[i]
                 if env.world.grid[y, x] == 1:
                     total_obstacle_collisions += 1
             for i in range(num_agents):
-                for j in range(i+1, num_agents):
+                for j in range(i + 1, num_agents):
                     if positions[i] == positions[j]:
                         total_agent_collisions += 1
 
@@ -238,33 +270,43 @@ def run_scenario(map_size, num_agents, num_servers, mask_enabled, filter2_enable
 
     return total_agent_collisions, total_obstacle_collisions, total_steps, total_coverage
 
+
+# ============================================================================
+# Main entry point
+# ============================================================================
 if __name__ == "__main__":
-    print("=== Filter Contribution Analysis (without filter 3) ===\n")
+    print("=== Filter Contribution Analysis (without Filter 3) ===\n")
 
     map_size = 60
     num_agents = 10
     num_servers = 10
     trials = 3
 
-    # Scenario A: no filter1, no filter2
+    # Scenario A: No Filter 1, no Filter 2
     print("Running Scenario A: no filters...")
-    aa_A, ao_A, steps_A, cov_A = run_scenario(map_size, num_agents, num_servers,
-                                               mask_enabled=False, filter2_enabled=False, trials=trials)
-    print(f"  Agent-Agent collisions: {aa_A}, Agent-Obstacle collisions: {ao_A}, Steps: {steps_A}, Coverage: {cov_A/trials*100:.1f}%")
+    aa_A, ao_A, steps_A, cov_A = run_scenario(
+        map_size, num_agents, num_servers,
+        mask_enabled=False, filter2_enabled=False, trials=trials)
+    print(f"  Agent-Agent collisions: {aa_A}, Agent-Obstacle collisions: {ao_A}, "
+          f"Steps: {steps_A}, Coverage: {cov_A / trials * 100:.1f}%")
 
-    # Scenario B: only filter1
-    print("Running Scenario B: filter1 only...")
-    aa_B, ao_B, steps_B, cov_B = run_scenario(map_size, num_agents, num_servers,
-                                               mask_enabled=True, filter2_enabled=False, trials=trials)
-    print(f"  Agent-Agent collisions: {aa_B}, Agent-Obstacle collisions: {ao_B}, Steps: {steps_B}, Coverage: {cov_B/trials*100:.1f}%")
+    # Scenario B: Filter 1 only
+    print("Running Scenario B: Filter 1 only...")
+    aa_B, ao_B, steps_B, cov_B = run_scenario(
+        map_size, num_agents, num_servers,
+        mask_enabled=True, filter2_enabled=False, trials=trials)
+    print(f"  Agent-Agent collisions: {aa_B}, Agent-Obstacle collisions: {ao_B}, "
+          f"Steps: {steps_B}, Coverage: {cov_B / trials * 100:.1f}%")
 
-    # Scenario C: filter1 + filter2
-    print("Running Scenario C: filter1 + filter2...")
-    aa_C, ao_C, steps_C, cov_C = run_scenario(map_size, num_agents, num_servers,
-                                               mask_enabled=True, filter2_enabled=True, trials=trials)
-    print(f"  Agent-Agent collisions: {aa_C}, Agent-Obstacle collisions: {ao_C}, Steps: {steps_C}, Coverage: {cov_C/trials*100:.1f}%")
+    # Scenario C: Filter 1 + Filter 2
+    print("Running Scenario C: Filter 1 + Filter 2...")
+    aa_C, ao_C, steps_C, cov_C = run_scenario(
+        map_size, num_agents, num_servers,
+        mask_enabled=True, filter2_enabled=True, trials=trials)
+    print(f"  Agent-Agent collisions: {aa_C}, Agent-Obstacle collisions: {ao_C}, "
+          f"Steps: {steps_C}, Coverage: {cov_C / trials * 100:.1f}%")
 
-    # Compute prevented counts
+    # ---- Compute prevented counts ----
     total_potential_aa = aa_A
     total_potential_ao = ao_A
     filter1_prev_aa = aa_A - aa_B
@@ -280,7 +322,7 @@ if __name__ == "__main__":
     print(f"Filter2 prevented: AA={filter2_prev_aa}, AO={filter2_prev_ao}")
     print(f"Remaining after both filters: AA={remaining_aa}, AO={remaining_ao}")
 
-    # Plot 1: Bar chart of contributions
+    # ---- Plot 1: Bar chart of contributions ----
     fig, ax = plt.subplots(figsize=(10, 6))
     categories = ['Potential', 'Filter1 Prevented', 'Filter2 Prevented', 'Remaining']
     aa_vals = [total_potential_aa, filter1_prev_aa, filter2_prev_aa, remaining_aa]
@@ -289,12 +331,14 @@ if __name__ == "__main__":
     x = np.arange(len(categories))
     width = 0.35
 
-    ax.bar(x - width/2, aa_vals, width, label='Agent-Agent', color='red')
-    ax.bar(x + width/2, ao_vals, width, label='Agent-Obstacle', color='orange')
+    ax.bar(x - width / 2, aa_vals, width, label='Agent-Agent', color='red')
+    ax.bar(x + width / 2, ao_vals, width, label='Agent-Obstacle', color='orange')
 
     ax.set_xlabel('Filter Contribution')
     ax.set_ylabel('Collision Count')
-    ax.set_title(f'Filter Contribution Analysis (Map {map_size}×{map_size}, {num_agents} agents, {num_servers} servers, {trials} trials)')
+    ax.set_title(f'Filter Contribution Analysis '
+                 f'(Map {map_size}×{map_size}, {num_agents} agents, '
+                 f'{num_servers} servers, {trials} trials)')
     ax.set_xticks(x)
     ax.set_xticklabels(categories)
     ax.legend()
@@ -304,13 +348,15 @@ if __name__ == "__main__":
     save_path = os.path.join(os.path.dirname(__file__), '..', 'videos', 'filter_contribution.png')
     plt.savefig(save_path, dpi=150)
     print(f"Plot saved to {save_path}")
-    plt.show()
+    if INTERACTIVE:
+        plt.show()
+    plt.close(fig)
 
-    # Plot 2: Line chart showing step and coverage per scenario (optional)
+    # ---- Plot 2: Steps and coverage across scenarios ----
     fig2, ax2 = plt.subplots(figsize=(8, 5))
     scenarios = ['No Filters', 'Filter1 Only', 'Filters 1+2']
-    steps = [steps_A/trials, steps_B/trials, steps_C/trials]
-    covs = [cov_A/trials*100, cov_B/trials*100, cov_C/trials*100]
+    steps = [steps_A / trials, steps_B / trials, steps_C / trials]
+    covs = [cov_A / trials * 100, cov_B / trials * 100, cov_C / trials * 100]
     ax2.bar(scenarios, steps, color='blue', alpha=0.6, label='Avg Steps')
     ax2.set_ylabel('Steps', color='blue')
     ax2.tick_params(axis='y', labelcolor='blue')
@@ -321,7 +367,10 @@ if __name__ == "__main__":
     ax2.set_title('Steps and Coverage across Scenarios')
     ax2.grid(True, alpha=0.3)
     plt.tight_layout()
-    save_path2 = os.path.join(os.path.dirname(__file__), '..', 'videos', 'filter_contribution_steps_coverage.png')
+    save_path2 = os.path.join(os.path.dirname(__file__), '..', 'videos',
+                              'filter_contribution_steps_coverage.png')
     plt.savefig(save_path2, dpi=150)
     print(f"Second plot saved to {save_path2}")
-    plt.show()
+    if INTERACTIVE:
+        plt.show()
+    plt.close(fig2)
