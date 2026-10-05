@@ -66,11 +66,18 @@ class EpisodicReplayBuffer:
 
     def _pad_episode(self, ep, pad_len):
         for _ in range(pad_len):
-            ep['global_states'].append(ep['global_states'][-1])
+            # ---- FIX: Handle empty global_states/next_global_states ----
+            if ep['global_states']:
+                ep['global_states'].append(ep['global_states'][-1])
+            else:
+                ep['global_states'].append(None)   # or [] – not used
+            if ep['next_global_states']:
+                ep['next_global_states'].append(ep['next_global_states'][-1])
+            else:
+                ep['next_global_states'].append(None)
             ep['obs_lists'].append(ep['obs_lists'][-1])
             ep['actions'].append(ep['actions'][-1])
             ep['rewards'].append(0.0)
-            ep['next_global_states'].append(ep['next_global_states'][-1])
             ep['next_obs_lists'].append(ep['next_obs_lists'][-1])
             ep['dones'].append(True)
 
